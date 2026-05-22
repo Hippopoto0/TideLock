@@ -1,7 +1,9 @@
+import asyncio
 import glob
 import json
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -45,7 +47,13 @@ class Node:
 
 
 class Flow:
-    def __init__(self, *edges: Edge, state_cls: type[BaseModel]):
+    def __init__(
+        self,
+        *edges: Edge,
+        state_cls: type[BaseModel],
+        on_node_start: Callable[[str], None] | None = None,
+        on_node_skip: Callable[[str], None] | None = None,
+    ):
         if not edges:
             raise ValueError("Flow requires at least one edge")
 
@@ -62,6 +70,19 @@ class Flow:
         self.start = starts.pop()
         self.state_cls = state_cls
         self.node_order = _ordered_node_names(self.start)
+        self.on_node_start = on_node_start or (lambda name: typer.echo(f"🚀 Running node: '{name}'..."))
+        self.on_node_skip = on_node_skip or (lambda name: typer.echo(f"↩️  [RESUME] Skipping node '{name}'..."))
+
+    def _run_async(self, coro) -> any:
+        """Run a coroutine on a persistent event loop, creating one if needed."""
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
 
     def run(self, mode: str, pid: str, from_node: str | None = None):
         save_run_metadata(pid, self.node_order)
@@ -81,14 +102,14 @@ class Flow:
                 and not force_run
                 and os.path.exists(os.path.join(node_dir, "_action.msgpack"))
             ):
-                typer.echo(
-                    f"↩️  [RESUME] Skipping node '{current_node.name}' and restoring state schema..."
-                )
+                self.on_node_skip(current_node.name)
                 action = load_node_checkpoint(pid, current_node.name, shared)
             else:
                 force_run = True
-                typer.echo(f"🚀 Running node: '{current_node.name}'...")
+                self.on_node_start(current_node.name)
                 action = current_node.func(shared)
+                if asyncio.iscoroutine(action):
+                    action = self._run_async(action)
                 if action is None:
                     action = "default"
 
@@ -331,9 +352,30 @@ def resume(
     start_flow("resume", new_pid, from_node)
 
 
+def _most_recent_run() -> str | None:
+    """Return the most recently modified run directory under RUNS_DIR, or None."""
+    runs_path = os.path.join(RUNS_DIR)
+    if not os.path.exists(runs_path):
+        return None
+    dirs = [
+        d for d in os.listdir(runs_path)
+        if os.path.isdir(os.path.join(runs_path, d))
+    ]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda d: os.path.getmtime(os.path.join(runs_path, d)))
+
+
 @cli.command()
-def inspect(pid: str = typer.Argument(..., help="The explicit Run PID to view")):
+def inspect(pid: str | None = typer.Argument(None, help="Run PID to inspect (defaults to most recent)")):
     """Interactively select a node via searchable list, then launch the Textual TUI viewer."""
+    if pid is None:
+        pid = _most_recent_run()
+        if pid is None:
+            typer.secho("No runs found in .pipeline_runs/", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        typer.echo(f"Using most recent run: {pid}")
+
     selected_node = prompt_select_node(
         pid,
         "Select a pipeline node to view its state context (Type to filter options):",
@@ -341,6 +383,6 @@ def inspect(pid: str = typer.Argument(..., help="The explicit Run PID to view"))
     if not selected_node:
         return
 
-    from tui import NodeInspectorApp
+    from tidelock.tui import NodeInspectorApp
 
     NodeInspectorApp(pid, selected_node).run()

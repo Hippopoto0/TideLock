@@ -10,7 +10,7 @@ from textual.containers import Horizontal, Vertical
 from textual.document._document import Selection
 from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, TextArea
 
-from engine import RUNS_DIR
+from tidelock.engine import RUNS_DIR
 
 SEARCH_CONTEXT_CHARS = 80
 MAX_SEARCH_MATCHES = 100
