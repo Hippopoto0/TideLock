@@ -12,11 +12,10 @@ uv add tidelock  # or pip install tidelock
 
 ```python
 # pipeline.py
-from tidelock.engine import Flow, cli, pipeline, step
-from pydantic import BaseModel
+from tidelock.engine import Flow, PipelineState, cli, pipeline, step
 
-class State(BaseModel):
-    records: list[dict] | None = None
+class State(PipelineState):
+    records: list[dict]
 
 @step("fetch")
 def fetch(shared: State):
@@ -111,17 +110,27 @@ def my_step(shared: MyState) -> str | None:
 
 ## State
 
-State is a **Pydantic `BaseModel`**. Every field is serialized automatically after each step:
+Inherit from `PipelineState` (re-exported from `tidelock.engine`):
+
+```python
+from tidelock.engine import PipelineState
+
+class State(PipelineState):
+    topic: str = "default"
+    queries: list[str]          # auto default_factory=list
+    sources: dict[str, str]     # auto default_factory=dict
+    results: pd.DataFrame | None = None
+```
+
+Two conveniences over plain `BaseModel`:
+
+- **Bare collection annotations** (`list`, `dict`, `set`) automatically get `default_factory` — no `Field(default_factory=list)` boilerplate needed.
+- **Field references** work as class attributes (`State.queries`, `State.sources`), used by `.map()` to avoid magic strings.
+
+Every field is serialized automatically after each step:
 
 - Plain Python values (lists, dicts, strings, numbers) → msgpack
 - `pd.DataFrame` fields → parquet
-
-```python
-class PipelineState(BaseModel):
-    raw: list[dict] | None = None
-    results: pd.DataFrame | None = None
-    tag: str | None = None
-```
 
 Fields set to `None` are not written to disk. Checkpoints are stored under `.pipeline_runs/<pid>/<node_name>/`.
 
