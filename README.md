@@ -125,6 +125,56 @@ from tidelock.engine import Flow, cli, pipeline, step
 
 ---
 
+## Retry policies
+
+Steps can declare a retry policy for transient failures.
+
+**Simple shorthand** — `retries` and `retry_delay`:
+
+```python
+@step("gather", retries=3, retry_delay=2.0)
+async def gather(shared: State):
+    ...
+```
+
+`retries=3` means up to 4 total attempts. Delays follow an exponential backoff: 2 s, 4 s, 8 s.
+
+**Full control** — pass a `RetryPolicy` object:
+
+```python
+from tidelock.engine import RetryPolicy, step
+
+@step("gather", retry=RetryPolicy(
+    attempts=4,
+    delay=1.0,
+    backoff=2.0,          # delay doubles each attempt: 1 s → 2 s → 4 s
+    jitter=0.25,          # ±25 % random spread to avoid thundering-herd
+    on=RateLimitError,    # only retry this exception; others propagate immediately
+))
+async def gather(shared: State):
+    ...
+```
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `attempts` | `1` | Total tries (retries + 1) |
+| `delay` | `1.0` | Wait in seconds before the second attempt |
+| `backoff` | `2.0` | Multiplier applied to delay after each failure (`1.0` = fixed) |
+| `jitter` | `0.0` | Random ±fraction added to each wait to spread retries |
+| `on` | `Exception` | Exception class or tuple of classes to catch; everything else propagates immediately |
+
+If all attempts are exhausted the original exception is re-raised. A step that eventually succeeds checkpoints once, as if it had run without retries — the retry loop is invisible to the resume system.
+
+Failed attempts are logged to stderr:
+
+```
+⚠ gather  attempt 1/4 — RateLimitError: quota exceeded  (retry in 1.0s)
+⚠ gather  attempt 2/4 — RateLimitError: quota exceeded  (retry in 2.0s)
+⚠ gather  attempt 3/4 — RateLimitError: quota exceeded  (retry in 4.0s)
+```
+
+---
+
 ## Pipeline decorator
 
 ```python

@@ -2,9 +2,11 @@ import asyncio
 import glob
 import json
 import os
+import random
 import shutil
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import msgpack
@@ -14,6 +16,27 @@ from pydantic import BaseModel
 
 RUNS_DIR = "./.pipeline_runs"
 _flow_generator = None  # Holds the user's create_graph function
+
+
+# --- 0. RETRY POLICY ---
+
+@dataclass
+class RetryPolicy:
+    """Retry policy for a pipeline step.
+
+    attempts : total number of tries (so retries=3 → attempts=4).
+    delay    : initial wait in seconds before the second attempt.
+    backoff  : multiplier applied to delay after each failure (1.0 = fixed).
+    jitter   : random ±fraction of the computed delay (0.0 = no jitter).
+    on       : exception class or tuple of classes to catch and retry;
+               anything else propagates immediately without consuming budget.
+    """
+
+    attempts: int = 1
+    delay: float = 1.0
+    backoff: float = 2.0
+    jitter: float = 0.0
+    on: type[Exception] | tuple[type[Exception], ...] = field(default=Exception)
 
 
 # --- 1. POCKETFLOW CORE ABSTRACTION CLONE ---
@@ -34,9 +57,10 @@ class ConditionalBranch:
 
 
 class Node:
-    def __init__(self, name: str, func):
+    def __init__(self, name: str, func, retry: RetryPolicy | None = None):
         self.name = name
         self.func = func
+        self.retry = retry
         self.transitions = {}  # action_name -> Node
 
     def __rshift__(self, other: "Node") -> Edge:
@@ -288,9 +312,82 @@ def prompt_select_node(pid: str, message: str, *, checkpointed_only: bool = True
 
 
 # --- 3. THE FRAMEWORK DECORATORS ---
-def step(name: str):
+
+def step(
+    name: str,
+    *,
+    retries: int = 0,
+    retry_delay: float = 1.0,
+    retry: RetryPolicy | None = None,
+):
+    """Declare a pipeline step.
+
+    Simple retry shorthand::
+
+        @step("gather", retries=3, retry_delay=2.0)
+        async def gather(shared): ...
+
+    Full control via RetryPolicy::
+
+        @step("gather", retry=RetryPolicy(attempts=4, delay=1.0, backoff=2.0, on=RateLimitError))
+        async def gather(shared): ...
+
+    ``retries=N`` is sugar for ``RetryPolicy(attempts=N+1, delay=retry_delay)``.
+    """
+    if retry is None and retries:
+        retry = RetryPolicy(attempts=retries + 1, delay=retry_delay)
+
     def decorator(func):
-        return Node(name, func)
+        if retry is None:
+            return Node(name, func)
+
+        policy = retry
+
+        def _warn(attempt: int, exc: Exception, wait: float) -> None:
+            typer.secho(
+                f"  ⚠ {name}  attempt {attempt}/{policy.attempts} — "
+                f"{type(exc).__name__}: {exc}  (retry in {wait:.1f}s)",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+
+        def _next_wait(current: float) -> float:
+            w = current * policy.backoff
+            if policy.jitter:
+                w += w * random.uniform(-policy.jitter, policy.jitter)
+            return w
+
+        if asyncio.iscoroutinefunction(func):
+            async def _wrapped_async(shared):
+                wait = policy.delay
+                for attempt in range(1, policy.attempts + 1):
+                    try:
+                        return await func(shared)
+                    except policy.on as exc:
+                        if attempt == policy.attempts:
+                            raise
+                        _warn(attempt, exc, wait)
+                        await asyncio.sleep(wait)
+                        wait = _next_wait(wait)
+
+            _wrapped_async.__name__ = func.__name__
+            return Node(name, _wrapped_async, retry=policy)
+
+        else:
+            def _wrapped_sync(shared):
+                wait = policy.delay
+                for attempt in range(1, policy.attempts + 1):
+                    try:
+                        return func(shared)
+                    except policy.on as exc:
+                        if attempt == policy.attempts:
+                            raise
+                        _warn(attempt, exc, wait)
+                        time.sleep(wait)
+                        wait = _next_wait(wait)
+
+            _wrapped_sync.__name__ = func.__name__
+            return Node(name, _wrapped_sync, retry=policy)
 
     return decorator
 
