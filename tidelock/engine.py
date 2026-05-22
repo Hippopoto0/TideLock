@@ -53,7 +53,25 @@ class Flow:
         state_cls: type[BaseModel],
         on_node_start: Callable[[str], None] | None = None,
         on_node_skip: Callable[[str], None] | None = None,
+        wrap: Callable[[any], any] | None = None,
     ):
+        """
+        Args:
+            wrap: Optional factory called with the freshly-created (or resumed)
+                  shared state object; must return an async context manager that
+                  wraps the entire pipeline execution.  Useful for setting up a
+                  WavePilot ``group`` scope around all steps::
+
+                      wrap=lambda shared: group(
+                          name="pipeline",
+                          track_history=shared.memory,
+                          hooks=[my_hook],
+                      )
+
+                  On resume the shared state is pre-populated from checkpoints
+                  before ``wrap`` is called, so ``shared.memory`` already
+                  contains history from previous runs.
+        """
         if not edges:
             raise ValueError("Flow requires at least one edge")
 
@@ -72,6 +90,7 @@ class Flow:
         self.node_order = _ordered_node_names(self.start)
         self.on_node_start = on_node_start or (lambda name: typer.echo(f"🚀 Running node: '{name}'..."))
         self.on_node_skip = on_node_skip or (lambda name: typer.echo(f"↩️  [RESUME] Skipping node '{name}'..."))
+        self._wrap = wrap
 
     def _run_async(self, coro) -> any:
         """Run a coroutine on a persistent event loop, creating one if needed."""
@@ -85,9 +104,32 @@ class Flow:
         return loop.run_until_complete(coro)
 
     def run(self, mode: str, pid: str, from_node: str | None = None):
+        """Run all steps in a single async context so wrap spans the whole pipeline."""
         save_run_metadata(pid, self.node_order)
+        self._run_async(self._execute(mode, pid, from_node))
+
+    async def _execute(self, mode: str, pid: str, from_node: str | None = None):
+        """Async entry point: restore state, enter wrap context, run all steps."""
+        from contextlib import nullcontext
 
         shared = self.state_cls()
+
+        # Pre-load checkpointed state before entering wrap so that shared.memory
+        # (and any other list/dict fields) are already populated when wrap(shared)
+        # is called.  On a fresh run this loop does nothing.
+        if mode == "resume":
+            for name in self.node_order:
+                if from_node and name == from_node:
+                    break
+                if node_has_checkpoint(pid, name):
+                    load_node_checkpoint(pid, name, shared)
+
+        cm = self._wrap(shared) if self._wrap is not None else nullcontext()
+        async with cm:
+            await self._run_steps(mode, pid, from_node, shared)
+
+    async def _run_steps(self, mode: str, pid: str, from_node: str | None, shared) -> None:
+        """Walk the graph, skipping or executing each node."""
         current_node = self.start
         force_run = False
 
@@ -109,7 +151,7 @@ class Flow:
                 self.on_node_start(current_node.name)
                 action = current_node.func(shared)
                 if asyncio.iscoroutine(action):
-                    action = self._run_async(action)
+                    action = await action
                 if action is None:
                     action = "default"
 
