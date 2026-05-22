@@ -131,12 +131,36 @@ class Flow:
             else:
                 force_run = True
                 self.on_node_start(current_node.name)
-                action = current_node.func(shared)
-                if asyncio.iscoroutine(action):
-                    action = self._run_async(action)
-                if action is None:
-                    action = "default"
+                started_at = datetime.now()
+                try:
+                    action = current_node.func(shared)
+                    if asyncio.iscoroutine(action):
+                        action = self._run_async(action)
+                    if action is None:
+                        action = "default"
+                except Exception as exc:
+                    completed_at = datetime.now()
+                    save_step_meta(pid, current_node.name, {
+                        "status": "failed",
+                        "started_at": started_at.isoformat(),
+                        "completed_at": completed_at.isoformat(),
+                        "duration_s": round((completed_at - started_at).total_seconds(), 3),
+                        "retry_attempts": getattr(current_node.func, "_attempts_taken", 1),
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    })
+                    raise
 
+                completed_at = datetime.now()
+                save_step_meta(pid, current_node.name, {
+                    "status": "completed",
+                    "started_at": started_at.isoformat(),
+                    "completed_at": completed_at.isoformat(),
+                    "duration_s": round((completed_at - started_at).total_seconds(), 3),
+                    "retry_attempts": getattr(current_node.func, "_attempts_taken", 1),
+                    "error_type": None,
+                    "error_message": None,
+                })
                 save_node_checkpoint(pid, current_node.name, shared, action)
 
             # Evaluate where the graph moves next
@@ -215,6 +239,21 @@ def load_node_checkpoint(pid, node_name, shared):
             setattr(shared, key, msgpack.unpackb(f.read(), raw=False))
 
     with open(os.path.join(node_dir, "_action.msgpack"), "rb") as f:
+        return msgpack.unpackb(f.read(), raw=False)
+
+
+def save_step_meta(pid: str, node_name: str, meta: dict) -> None:
+    node_dir = os.path.join(RUNS_DIR, pid, node_name)
+    os.makedirs(node_dir, exist_ok=True)
+    with open(os.path.join(node_dir, "_meta.msgpack"), "wb") as f:
+        f.write(msgpack.packb(meta, use_bin_type=True))
+
+
+def load_step_meta(pid: str, node_name: str) -> dict | None:
+    path = os.path.join(RUNS_DIR, pid, node_name, "_meta.msgpack")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
         return msgpack.unpackb(f.read(), raw=False)
 
 
@@ -362,8 +401,11 @@ def step(
                 wait = policy.delay
                 for attempt in range(1, policy.attempts + 1):
                     try:
-                        return await func(shared)
+                        result = await func(shared)
+                        _wrapped_async._attempts_taken = attempt
+                        return result
                     except policy.on as exc:
+                        _wrapped_async._attempts_taken = attempt
                         if attempt == policy.attempts:
                             raise
                         _warn(attempt, exc, wait)
@@ -371,6 +413,7 @@ def step(
                         wait = _next_wait(wait)
 
             _wrapped_async.__name__ = func.__name__
+            _wrapped_async._attempts_taken = 1
             return Node(name, _wrapped_async, retry=policy)
 
         else:
@@ -378,8 +421,11 @@ def step(
                 wait = policy.delay
                 for attempt in range(1, policy.attempts + 1):
                     try:
-                        return func(shared)
+                        result = func(shared)
+                        _wrapped_sync._attempts_taken = attempt
+                        return result
                     except policy.on as exc:
+                        _wrapped_sync._attempts_taken = attempt
                         if attempt == policy.attempts:
                             raise
                         _warn(attempt, exc, wait)
@@ -387,6 +433,7 @@ def step(
                         wait = _next_wait(wait)
 
             _wrapped_sync.__name__ = func.__name__
+            _wrapped_sync._attempts_taken = 1
             return Node(name, _wrapped_sync, retry=policy)
 
     return decorator

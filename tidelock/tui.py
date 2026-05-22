@@ -7,10 +7,10 @@ import msgpack
 import pandas as pd
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, Static, TextArea
 from textual.document._document import Selection
-from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, TextArea
 
-from tidelock.engine import RUNS_DIR
+from tidelock.engine import RUNS_DIR, load_step_meta
 
 SEARCH_CONTEXT_CHARS = 80
 MAX_SEARCH_MATCHES = 100
@@ -81,6 +81,7 @@ class NodeInspectorApp(App):
     Label { text-style: bold; margin-bottom: 1; color: #1abc9c; }
     #df_view, #text_view { display: none; }
     #text_view.visible { display: block; height: 1fr; }
+    #meta_strip { padding: 0 1; margin-bottom: 1; color: #aaaaaa; }
     """
     BINDINGS = [
         ("/", "focus_search", "Search"),
@@ -93,10 +94,12 @@ class NodeInspectorApp(App):
         self.pid = pid
         self.node_name = node_name
         self.node_dir = os.path.join(RUNS_DIR, pid, node_name)
+        self.step_meta: dict | None = load_step_meta(pid, node_name)
         self.variables = []
         if os.path.exists(self.node_dir):
+            # Exclude all internal files (underscore-prefixed)
             self.variables = sorted(
-                f for f in os.listdir(self.node_dir) if not f.startswith("_action")
+                f for f in os.listdir(self.node_dir) if not f.startswith("_")
             )
         self.file_by_var_id = {f"var-{i}": filename for i, filename in enumerate(self.variables)}
         self.current_text = ""
@@ -105,11 +108,44 @@ class NodeInspectorApp(App):
         self.search_matches: list[SearchMatch] = []
         self.search_error: str | None = None
 
+    def _format_meta(self) -> str:
+        m = self.step_meta
+        if not m:
+            return ""
+
+        status = m.get("status", "")
+        if status == "completed":
+            icon = "[bold green]✓[/bold green]"
+        elif status == "failed":
+            icon = "[bold red]✗[/bold red]"
+        else:
+            icon = "[dim]·[/dim]"
+
+        duration = m.get("duration_s")
+        duration_str = f"  {duration:.2f}s" if duration is not None else ""
+
+        attempts = m.get("retry_attempts", 1)
+        # Surface retry count only when more than one attempt was used
+        retry_str = f"\n[yellow]⟳ attempt {attempts}[/yellow]" if attempts and attempts > 1 else ""
+
+        error_type = m.get("error_type")
+        error_msg = m.get("error_message") or ""
+        error_str = f"\n[red]{error_type}[/red]" if error_type else ""
+        if error_type and error_msg:
+            # Truncate long messages to fit the sidebar
+            truncated = error_msg[:26] + "…" if len(error_msg) > 27 else error_msg
+            error_str += f"\n[dim]{truncated}[/dim]"
+
+        return f"{icon}[dim]{duration_str}[/dim]{retry_str}{error_str}"
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal():
             with Vertical(id="sidebar"):
                 yield Label(f" Node: {self.node_name}")
+                meta_markup = self._format_meta()
+                if meta_markup:
+                    yield Static(meta_markup, id="meta_strip")
                 yield ListView(
                     *[
                         ListItem(Label(os.path.splitext(v)[0]), id=f"var-{i}")
