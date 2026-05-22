@@ -110,64 +110,85 @@ class Flow:
 
     def run(self, mode: str, pid: str, from_node: str | None = None):
         save_run_metadata(pid, self.node_order)
+        run_started_at = datetime.now()
 
         shared = self.state_cls()
         current_node = self.start
         force_run = False
 
-        while current_node:
-            node_dir = os.path.join(RUNS_DIR, pid, current_node.name)
+        try:
+            while current_node:
+                node_dir = os.path.join(RUNS_DIR, pid, current_node.name)
 
-            if mode == "resume" and from_node and current_node.name == from_node:
-                force_run = True
+                if mode == "resume" and from_node and current_node.name == from_node:
+                    force_run = True
 
-            if (
-                mode == "resume"
-                and not force_run
-                and os.path.exists(os.path.join(node_dir, "_action.msgpack"))
-            ):
-                self.on_node_skip(current_node.name)
-                action = load_node_checkpoint(pid, current_node.name, shared)
-            else:
-                force_run = True
-                self.on_node_start(current_node.name)
-                started_at = datetime.now()
-                try:
-                    action = current_node.func(shared)
-                    if asyncio.iscoroutine(action):
-                        action = self._run_async(action)
-                    if action is None:
-                        action = "default"
-                except Exception as exc:
+                if (
+                    mode == "resume"
+                    and not force_run
+                    and os.path.exists(os.path.join(node_dir, "_action.msgpack"))
+                ):
+                    self.on_node_skip(current_node.name)
+                    action = load_node_checkpoint(pid, current_node.name, shared)
+                else:
+                    force_run = True
+                    self.on_node_start(current_node.name)
+                    started_at = datetime.now()
+                    try:
+                        action = current_node.func(shared)
+                        if asyncio.iscoroutine(action):
+                            action = self._run_async(action)
+                        if action is None:
+                            action = "default"
+                    except Exception as exc:
+                        completed_at = datetime.now()
+                        save_step_meta(pid, current_node.name, {
+                            "status": "failed",
+                            "started_at": started_at.isoformat(),
+                            "completed_at": completed_at.isoformat(),
+                            "duration_s": round((completed_at - started_at).total_seconds(), 3),
+                            "retry_attempts": getattr(current_node.func, "_attempts_taken", 1),
+                            "error_type": type(exc).__name__,
+                            "error_message": str(exc),
+                        })
+                        save_node_state(pid, current_node.name, shared)
+                        raise
+
                     completed_at = datetime.now()
                     save_step_meta(pid, current_node.name, {
-                        "status": "failed",
+                        "status": "completed",
                         "started_at": started_at.isoformat(),
                         "completed_at": completed_at.isoformat(),
                         "duration_s": round((completed_at - started_at).total_seconds(), 3),
                         "retry_attempts": getattr(current_node.func, "_attempts_taken", 1),
-                        "error_type": type(exc).__name__,
-                        "error_message": str(exc),
+                        "error_type": None,
+                        "error_message": None,
                     })
-                    raise
+                    save_node_checkpoint(pid, current_node.name, shared, action)
 
-                completed_at = datetime.now()
-                save_step_meta(pid, current_node.name, {
-                    "status": "completed",
-                    "started_at": started_at.isoformat(),
-                    "completed_at": completed_at.isoformat(),
-                    "duration_s": round((completed_at - started_at).total_seconds(), 3),
-                    "retry_attempts": getattr(current_node.func, "_attempts_taken", 1),
-                    "error_type": None,
-                    "error_message": None,
-                })
-                save_node_checkpoint(pid, current_node.name, shared, action)
+                # Evaluate where the graph moves next
+                if action in current_node.transitions:
+                    current_node = current_node.transitions[action]
+                else:
+                    current_node = current_node.transitions.get("default")
 
-            # Evaluate where the graph moves next
-            if action in current_node.transitions:
-                current_node = current_node.transitions[action]
-            else:
-                current_node = current_node.transitions.get("default")
+        except Exception:
+            finished_at = datetime.now()
+            update_run_metadata(
+                pid,
+                status="failed",
+                completed_at=finished_at.isoformat(),
+                duration_s=round((finished_at - run_started_at).total_seconds(), 3),
+            )
+            raise
+
+        finished_at = datetime.now()
+        update_run_metadata(
+            pid,
+            status="completed",
+            completed_at=finished_at.isoformat(),
+            duration_s=round((finished_at - run_started_at).total_seconds(), 3),
+        )
 
 
 # --- 2. STATE PERSISTENCE HELPERS ---
@@ -193,10 +214,29 @@ def save_run_metadata(pid: str, nodes: list[str]) -> None:
     if os.path.exists(metadata_path):
         return
     with open(metadata_path, "w") as f:
-        json.dump({"nodes": nodes}, f, indent=2)
+        json.dump({
+            "nodes": nodes,
+            "status": "running",
+            "started_at": datetime.now().isoformat(),
+            "completed_at": None,
+            "duration_s": None,
+        }, f, indent=2)
+
+
+def update_run_metadata(pid: str, **fields) -> None:
+    """Patch specific fields in metadata.json."""
+    metadata_path = os.path.join(RUNS_DIR, pid, "metadata.json")
+    if not os.path.exists(metadata_path):
+        return
+    with open(metadata_path) as f:
+        data = json.load(f)
+    data.update(fields)
+    with open(metadata_path, "w") as f:
+        json.dump(data, f, indent=2)
 
 
 def load_run_metadata(pid: str) -> list[str] | None:
+    """Return the ordered node list for a run, or None if metadata is missing."""
     metadata_path = os.path.join(RUNS_DIR, pid, "metadata.json")
     if not os.path.exists(metadata_path):
         return None
@@ -208,22 +248,36 @@ def load_run_metadata(pid: str) -> list[str] | None:
     return nodes
 
 
-def save_node_checkpoint(pid, node_name, shared, action):
+def load_run_summary(pid: str) -> dict | None:
+    """Return the full metadata dict for a run, or None if missing."""
+    metadata_path = os.path.join(RUNS_DIR, pid, "metadata.json")
+    if not os.path.exists(metadata_path):
+        return None
+    with open(metadata_path) as f:
+        return json.load(f)
+
+
+def save_node_state(pid: str, node_name: str, shared) -> None:
+    """Serialize all non-None state fields for a node. Does not write the routing action."""
     node_dir = os.path.join(RUNS_DIR, pid, node_name)
     os.makedirs(node_dir, exist_ok=True)
-    with open(os.path.join(node_dir, "_action.msgpack"), "wb") as f:
-        f.write(msgpack.packb(action, use_bin_type=True))
-
     for key in shared.model_fields:
         value = getattr(shared, key)
         if value is None:
             continue
-
         if isinstance(value, pd.DataFrame):
             value.to_parquet(os.path.join(node_dir, f"{key}.parquet"))
         else:
             with open(os.path.join(node_dir, f"{key}.msgpack"), "wb") as f:
                 f.write(msgpack.packb(value, use_bin_type=True))
+
+
+def save_node_checkpoint(pid, node_name, shared, action):
+    node_dir = os.path.join(RUNS_DIR, pid, node_name)
+    os.makedirs(node_dir, exist_ok=True)
+    with open(os.path.join(node_dir, "_action.msgpack"), "wb") as f:
+        f.write(msgpack.packb(action, use_bin_type=True))
+    save_node_state(pid, node_name, shared)
 
 
 def load_node_checkpoint(pid, node_name, shared):
@@ -321,23 +375,37 @@ def prompt_select_node(pid: str, message: str, *, checkpointed_only: bool = True
     order = load_run_metadata(pid) or nodes
     index_by_name = {name: idx for idx, name in enumerate(order)}
 
-    choices = [
-        questionary.Choice(
-            title=[
-                (
-                    "class:completed" if node_has_checkpoint(pid, node) else "class:pending",
-                    f"{index_by_name[node]}.{node}",
-                )
-            ],
-            value=node,
+    choices = []
+    for node in nodes:
+        meta = load_step_meta(pid, node)
+        has_checkpoint = node_has_checkpoint(pid, node)
+
+        if meta and meta.get("status") == "failed":
+            name_style = "class:failed"
+        elif has_checkpoint:
+            name_style = "class:completed"
+        else:
+            name_style = "class:pending"
+
+        duration = meta.get("duration_s") if meta else None
+        duration_str = f"  {duration:.2f}s" if duration is not None else ""
+
+        choices.append(
+            questionary.Choice(
+                title=[
+                    (name_style, f"{index_by_name[node]}.{node}"),
+                    ("class:duration", duration_str),
+                ],
+                value=node,
+            )
         )
-        for node in nodes
-    ]
 
     style = questionary.Style(
         [
             ("completed", "fg:ansigreen bold"),
-            ("pending", "fg:ansired"),
+            ("failed", "fg:ansired bold"),
+            ("pending", "fg:ansiyellow"),
+            ("duration", "fg:#666666"),
         ]
     )
 
