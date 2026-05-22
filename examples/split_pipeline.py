@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from pydantic import BaseModel, Field
+from tidelock.engine import PipelineState as TLState
 
 from tidelock.engine import Flow, RetryPolicy, cli, pipeline, split, step
 
@@ -51,13 +51,13 @@ _fail_filings: bool = False
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
-class PipelineState(BaseModel):
+class PipelineState(TLState):
     topic: str = "renewable energy investment landscape"
-    queries: list[str] = Field(default_factory=list)
-    news: list[str] = Field(default_factory=list)
-    filings: list[str] = Field(default_factory=list)
-    reports: list[str] = Field(default_factory=list)
-    findings: list[str] = Field(default_factory=list)
+    queries: list[str]
+    news: list[str]
+    filings: list[str]
+    reports: list[str]
+    findings: list[str]
     brief: str = ""
 
 

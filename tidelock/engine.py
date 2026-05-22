@@ -9,16 +9,102 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import inspect
+import typing
+
 import msgpack
 import pandas as pd
 import typer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from pydantic._internal._model_construction import ModelMetaclass
 
 RUNS_DIR = "./.pipeline_runs"
 _flow_generator = None  # Holds the user's create_graph function
 
+# Collection types that get an automatic default_factory when left bare
+_COLLECTION_ORIGINS = (list, dict, set)
 
-# --- 0. RETRY POLICY ---
+
+# --- 0. PIPELINE STATE ---
+
+class FieldRef:
+    """A reference to a named field on a PipelineState subclass.
+
+    Produced by attribute access on the class itself::
+
+        State.queries   # → FieldRef("queries")
+        State.sources   # → FieldRef("sources")
+
+    Used by .map() to avoid magic strings.
+    """
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"FieldRef({self.name!r})"
+
+
+def _collection_factory(annotation) -> type | None:
+    """Return the collection factory for an annotation, or None if not a collection.
+
+    Handles both real type objects (``list[str]``) and stringified annotations
+    produced by ``from __future__ import annotations`` (``"list[str]"``).
+    """
+    if isinstance(annotation, str):
+        s = annotation.strip()
+        for factory, prefix in ((list, "list["), (dict, "dict["), (set, "set[")):
+            if s == factory.__name__ or s.startswith(prefix):
+                return factory
+        return None
+    origin = typing.get_origin(annotation)
+    return origin if origin in _COLLECTION_ORIGINS else None
+
+
+class _PipelineStateMeta(ModelMetaclass):
+    def __new__(mcs, name, bases, namespace, **kwargs):
+        annotations = namespace.get("__annotations__", {})
+
+        for field_name, annotation in annotations.items():
+            # Skip private/dunder fields and ones that already have a default
+            if field_name.startswith("_") or field_name in namespace:
+                continue
+            factory = _collection_factory(annotation)
+            if factory is not None:
+                namespace[field_name] = Field(default_factory=factory)
+
+        return super().__new__(mcs, name, bases, namespace, **kwargs)
+
+    def __getattr__(cls, name: str) -> FieldRef:
+        # Walk the MRO and check __pydantic_fields__ directly via __dict__ to
+        # avoid calling cls.model_fields, which is a descriptor that calls
+        # getattr(cls, '__pydantic_fields__') and re-enters __getattr__.
+        for klass in cls.__mro__:
+            if name in klass.__dict__.get("__pydantic_fields__", {}):
+                return FieldRef(name)
+        raise AttributeError(f"{cls.__name__!r} has no field {name!r}")
+
+
+class PipelineState(BaseModel, metaclass=_PipelineStateMeta):
+    """Base class for TideLock pipeline state.
+
+    Two conveniences over plain ``BaseModel``:
+
+    * Bare collection annotations get an automatic ``default_factory``::
+
+        class State(PipelineState):
+            items: list[str]          # equivalent to Field(default_factory=list)
+            counts: dict[str, int]    # equivalent to Field(default_factory=dict)
+
+    * Field references work as class attributes, for use with ``.map()``::
+
+        State.items    # → FieldRef("items")
+        State.counts   # → FieldRef("counts")
+    """
+
+
+# --- 1. RETRY POLICY ---
 
 @dataclass
 class RetryPolicy:
