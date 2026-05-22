@@ -39,12 +39,20 @@ class RetryPolicy:
     on: type[Exception] | tuple[type[Exception], ...] = field(default=Exception)
 
 
-# --- 1. POCKETFLOW CORE ABSTRACTION CLONE ---
+# --- 1. GRAPH PRIMITIVES ---
+
 @dataclass
 class Edge:
     source: "Node"
     target: "Node"
     condition: str | None = None
+
+
+@dataclass
+class SplitEdge:
+    """Fan-out edge produced by the split() helper."""
+    source: "Node"
+    targets: list["Node"]
 
 
 @dataclass
@@ -61,33 +69,87 @@ class Node:
         self.name = name
         self.func = func
         self.retry = retry
-        self.transitions = {}  # action_name -> Node
+        self.transitions: dict[str, "Node"] = {}
+        self.split_targets: list["Node"] = []
 
-    def __rshift__(self, other: "Node") -> Edge:
+    def __rshift__(self, other: "Node | SplitGroup") -> "Edge | SplitGroup":
+        if isinstance(other, SplitGroup):
+            other._source = self
+            return other
         return Edge(self, other)
 
     def __sub__(self, label: str) -> ConditionalBranch:
         return ConditionalBranch(self, label)
 
 
+class SplitGroup:
+    """Returned by split(); participates in the >> DSL to produce fan-out edges."""
+
+    def __init__(self, *nodes: Node):
+        self.nodes = list(nodes)
+        self._source: Node | None = None
+
+    def __rshift__(self, target: Node) -> list[Edge | SplitEdge]:
+        edges: list[Edge | SplitEdge] = []
+        if self._source is not None:
+            edges.append(SplitEdge(self._source, list(self.nodes)))
+        for node in self.nodes:
+            edges.append(Edge(node, target))
+        return edges
+
+
+def split(*nodes: Node) -> SplitGroup:
+    """Declare concurrent step execution in a Flow edge chain.
+
+    Example::
+
+        Flow(
+            plan >> split(fetch_a, fetch_b, fetch_c) >> merge,
+            state_cls=State,
+        )
+
+    All steps inside split() run concurrently via asyncio.gather.
+    Each step should write to distinct fields on shared state to
+    avoid conflicts. Each step is checkpointed independently, so
+    partial failures resume correctly.
+    """
+    return SplitGroup(*nodes)
+
+
 class Flow:
     def __init__(
         self,
-        *edges: Edge,
+        *edge_args: "Edge | SplitEdge | list[Edge | SplitEdge]",
         state_cls: type[BaseModel],
         on_node_start: Callable[[str], None] | None = None,
         on_node_skip: Callable[[str], None] | None = None,
     ):
-        if not edges:
+        if not edge_args:
             raise ValueError("Flow requires at least one edge")
 
-        for edge in edges:
-            key = edge.condition or "default"
-            edge.source.transitions[key] = edge.target
+        # Flatten: split() returns a list of edges; plain >> returns a single Edge
+        edges: list[Edge | SplitEdge] = []
+        for arg in edge_args:
+            if isinstance(arg, list):
+                edges.extend(arg)
+            else:
+                edges.append(arg)
 
-        sources = {edge.source for edge in edges}
-        targets = {edge.target for edge in edges}
-        starts = sources - targets
+        all_sources: set[Node] = set()
+        all_targets: set[Node] = set()
+
+        for edge in edges:
+            if isinstance(edge, SplitEdge):
+                edge.source.split_targets = list(edge.targets)
+                all_sources.add(edge.source)
+                all_targets.update(edge.targets)
+            else:
+                key = edge.condition or "default"
+                edge.source.transitions[key] = edge.target
+                all_sources.add(edge.source)
+                all_targets.add(edge.target)
+
+        starts = all_sources - all_targets
         if len(starts) != 1:
             raise ValueError(f"Expected exactly one start node, found {len(starts)}")
 
@@ -111,67 +173,8 @@ class Flow:
     def run(self, mode: str, pid: str, from_node: str | None = None):
         save_run_metadata(pid, self.node_order)
         run_started_at = datetime.now()
-
-        shared = self.state_cls()
-        current_node = self.start
-        force_run = False
-
         try:
-            while current_node:
-                node_dir = os.path.join(RUNS_DIR, pid, current_node.name)
-
-                if mode == "resume" and from_node and current_node.name == from_node:
-                    force_run = True
-
-                if (
-                    mode == "resume"
-                    and not force_run
-                    and os.path.exists(os.path.join(node_dir, "_action.msgpack"))
-                ):
-                    self.on_node_skip(current_node.name)
-                    action = load_node_checkpoint(pid, current_node.name, shared)
-                else:
-                    force_run = True
-                    self.on_node_start(current_node.name)
-                    started_at = datetime.now()
-                    try:
-                        action = current_node.func(shared)
-                        if asyncio.iscoroutine(action):
-                            action = self._run_async(action)
-                        if action is None:
-                            action = "default"
-                    except Exception as exc:
-                        completed_at = datetime.now()
-                        save_step_meta(pid, current_node.name, {
-                            "status": "failed",
-                            "started_at": started_at.isoformat(),
-                            "completed_at": completed_at.isoformat(),
-                            "duration_s": round((completed_at - started_at).total_seconds(), 3),
-                            "retry_attempts": getattr(current_node.func, "_attempts_taken", 1),
-                            "error_type": type(exc).__name__,
-                            "error_message": str(exc),
-                        })
-                        save_node_state(pid, current_node.name, shared)
-                        raise
-
-                    completed_at = datetime.now()
-                    save_step_meta(pid, current_node.name, {
-                        "status": "completed",
-                        "started_at": started_at.isoformat(),
-                        "completed_at": completed_at.isoformat(),
-                        "duration_s": round((completed_at - started_at).total_seconds(), 3),
-                        "retry_attempts": getattr(current_node.func, "_attempts_taken", 1),
-                        "error_type": None,
-                        "error_message": None,
-                    })
-                    save_node_checkpoint(pid, current_node.name, shared, action)
-
-                # Evaluate where the graph moves next
-                if action in current_node.transitions:
-                    current_node = current_node.transitions[action]
-                else:
-                    current_node = current_node.transitions.get("default")
-
+            self._run_async(self._execute(mode, pid, from_node))
         except Exception:
             finished_at = datetime.now()
             update_run_metadata(
@@ -181,7 +184,6 @@ class Flow:
                 duration_s=round((finished_at - run_started_at).total_seconds(), 3),
             )
             raise
-
         finished_at = datetime.now()
         update_run_metadata(
             pid,
@@ -189,6 +191,98 @@ class Flow:
             completed_at=finished_at.isoformat(),
             duration_s=round((finished_at - run_started_at).total_seconds(), 3),
         )
+
+    async def _execute(self, mode: str, pid: str, from_node: str | None):
+        """Main execution loop — handles sequential steps and split groups."""
+        shared = self.state_cls()
+        current_node: Node | None = self.start
+        force_run = False
+
+        while current_node:
+            if mode == "resume" and from_node and current_node.name == from_node:
+                force_run = True
+
+            action, ran = await self._run_one(pid, current_node, shared, mode, force_run)
+            if ran:
+                force_run = True
+
+            if current_node.split_targets:
+                join_node = await self._run_split(pid, current_node, shared, mode, force_run)
+                current_node = join_node
+            elif action in current_node.transitions:
+                current_node = current_node.transitions[action]
+            else:
+                current_node = current_node.transitions.get("default")
+
+    async def _run_one(
+        self, pid: str, node: Node, shared, mode: str, force_run: bool
+    ) -> tuple[str, bool]:
+        """Run or skip a single node. Returns (action, was_run)."""
+        node_dir = os.path.join(RUNS_DIR, pid, node.name)
+
+        if (
+            mode == "resume"
+            and not force_run
+            and os.path.exists(os.path.join(node_dir, "_action.msgpack"))
+        ):
+            self.on_node_skip(node.name)
+            action = load_node_checkpoint(pid, node.name, shared)
+            return action, False
+
+        self.on_node_start(node.name)
+        started_at = datetime.now()
+        try:
+            result = node.func(shared)
+            if asyncio.iscoroutine(result):
+                result = await result
+            action = result if result is not None else "default"
+        except Exception as exc:
+            completed_at = datetime.now()
+            save_step_meta(pid, node.name, {
+                "status": "failed",
+                "started_at": started_at.isoformat(),
+                "completed_at": completed_at.isoformat(),
+                "duration_s": round((completed_at - started_at).total_seconds(), 3),
+                "retry_attempts": getattr(node.func, "_attempts_taken", 1),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            })
+            save_node_state(pid, node.name, shared)
+            raise
+
+        completed_at = datetime.now()
+        save_step_meta(pid, node.name, {
+            "status": "completed",
+            "started_at": started_at.isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "duration_s": round((completed_at - started_at).total_seconds(), 3),
+            "retry_attempts": getattr(node.func, "_attempts_taken", 1),
+            "error_type": None,
+            "error_message": None,
+        })
+        save_node_checkpoint(pid, node.name, shared, action)
+        return action, True
+
+    async def _run_split(
+        self, pid: str, source: Node, shared, mode: str, force_run: bool
+    ) -> Node | None:
+        """Run all split targets concurrently. Returns the join node."""
+        results = await asyncio.gather(
+            *[self._run_one(pid, node, shared, mode, force_run) for node in source.split_targets],
+            return_exceptions=True,
+        )
+
+        # Re-raise first exception after all branches have had a chance to run
+        for exc in results:
+            if isinstance(exc, Exception):
+                raise exc
+
+        # The join node is the default transition of any split target
+        for node in source.split_targets:
+            join = node.transitions.get("default")
+            if join:
+                return join
+        return None
 
 
 # --- 2. STATE PERSISTENCE HELPERS ---
@@ -202,6 +296,8 @@ def _ordered_node_names(start: Node) -> list[str]:
             continue
         seen.add(node.name)
         order.append(node.name)
+        for split_node in node.split_targets:
+            queue.append(split_node)
         for action in sorted(node.transitions):
             queue.append(node.transitions[action])
     return order
