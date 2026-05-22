@@ -69,6 +69,32 @@ A node can route back to itself. Return its own routing label (or `None` for the
 
 ---
 
+## Concurrent steps (`split`)
+
+Use `split()` to run independent branches concurrently:
+
+```python
+from tidelock.engine import Flow, split, step
+
+Flow(
+    plan >> split(fetch_news, fetch_filings, fetch_reports) >> merge,
+    state_cls=State,
+)
+```
+
+All steps inside `split()` run concurrently via `asyncio.gather`. Execution continues to the merge node only after every branch completes.
+
+**Checkpointing** — each branch checkpoints independently. On resume, completed branches are skipped and failed ones re-run:
+
+```
+first run:   fetch_news ✓   fetch_filings ✗   fetch_reports ✓
+resume:      fetch_news ↩   fetch_filings ↺   fetch_reports ↩
+```
+
+**Shared state** — concurrent branches should write to distinct fields on `shared` to avoid conflicts. Python's asyncio is single-threaded so there are no data races, but two branches writing the same field will overwrite each other.
+
+---
+
 ## Step functions
 
 ```python
