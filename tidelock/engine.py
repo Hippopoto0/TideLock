@@ -1,16 +1,17 @@
 import asyncio
 import glob
+import inspect
 import json
 import os
 import random
 import shutil
+import sys
 import time
+import traceback
+import typing
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-
-import inspect
-import typing
 
 import msgpack
 import pandas as pd
@@ -269,7 +270,18 @@ class Flow:
                 completed_at=finished_at.isoformat(),
                 duration_s=round((finished_at - run_started_at).total_seconds(), 3),
             )
-            raise
+            traceback.print_exc()
+            if mode == "resume":
+                typer.secho(
+                    "\n💡 Hint: This error likely means a step accessed state that wasn't"
+                    "\n   properly restored from the previous run's checkpoint. CSV"
+                    "\n   serialization loses dtype info (e.g. datetimes become strings),"
+                    "\n   so columns loaded from checkpoints may have different types than"
+                    "\n   expected. Add explicit type conversions in the failing step to"
+                    "\n   make it robust against resume.",
+                    fg=typer.colors.YELLOW,
+                )
+            sys.exit(1)
         finished_at = datetime.now()
         update_run_metadata(
             pid,
