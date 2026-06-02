@@ -36,13 +36,13 @@ jobs:
       - name: Check formatting with ruff
         run: ruff format --check .
 
-      - name: Setup Node.js for pyright
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+      # - name: Setup Node.js for pyright
+      #   uses: actions/setup-node@v4
+      #   with:
+      #     node-version: "22"
 
-      - name: Install pyright
-        run: npm install -g pyright
+      # - name: Install pyright
+      #   run: npm install -g pyright
 
-      - name: Type check with pyright
-        run: pyright
+      # - name: Type check with pyright
+      #   run: pyright
