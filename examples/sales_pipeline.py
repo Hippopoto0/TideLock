@@ -26,13 +26,12 @@ import csv
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated
 
 import pandas as pd
 import typer
-from tidelock.engine import PipelineState as TLState
 
-from tidelock.engine import Flow, RetryPolicy, cli, pipeline, split, step
+from tidelock.engine import Flow, pipeline, step
+from tidelock.engine import PipelineState as TLState
 
 _LOGS_DIR = Path(__file__).parent / "logs"
 _LOGS_DIR.mkdir(exist_ok=True)
@@ -61,18 +60,20 @@ def generate_data(shared: PipelineState) -> None:
     for i in range(n):
         qty = random.randint(1, 20)
         unit_price = round(random.uniform(5.0, 500.0), 2)
-        rows.append({
-            "order_id": f"ORD-{1000 + i}",
-            "date": (base + timedelta(days=random.randint(0, 365))).strftime("%Y-%m-%d"),
-            "category": random.choice(CATEGORIES),
-            "product": f"Product-{random.randint(1, 50)}",
-            "quantity": qty,
-            "unit_price": unit_price,
-            "total": round(qty * unit_price, 2),
-            "currency": random.choice(CURRENCIES),
-            "status": random.choice(STATUSES),
-            "customer_id": f"CUST-{random.randint(100, 999)}",
-        })
+        rows.append(
+            {
+                "order_id": f"ORD-{1000 + i}",
+                "date": (base + timedelta(days=random.randint(0, 365))).strftime("%Y-%m-%d"),
+                "category": random.choice(CATEGORIES),
+                "product": f"Product-{random.randint(1, 50)}",
+                "quantity": qty,
+                "unit_price": unit_price,
+                "total": round(qty * unit_price, 2),
+                "currency": random.choice(CURRENCIES),
+                "status": random.choice(STATUSES),
+                "customer_id": f"CUST-{random.randint(100, 999)}",
+            }
+        )
     rows[0]["quantity"] = -5
     rows[1]["total"] = None
     with open(path, "w", newline="") as f:
@@ -97,8 +98,9 @@ def clean_data(shared: PipelineState) -> None:
     df = df[df["quantity"] > 0]
     df = df.dropna(subset=["total"])
     df = df[df["total"] > 0]
+    rates = {"USD": 1.0, "EUR": 1.08, "GBP": 1.26, "JPY": 0.0067}
     df["revenue_usd"] = df.apply(
-        lambda r: r["total"] * {"USD": 1.0, "EUR": 1.08, "GBP": 1.26, "JPY": 0.0067}.get(r["currency"], 1.0),
+        lambda r: r["total"] * rates.get(r["currency"], 1.0),
         axis=1,
     )
     df["date"] = pd.to_datetime(df["date"])
@@ -144,6 +146,7 @@ def build() -> Flow:
 def run() -> None:
     """Execute the pipeline from the start node."""
     from tidelock.engine import start_flow
+
     start_flow("run")
 
 
@@ -154,6 +157,7 @@ def resume(
 ) -> None:
     """Resume a previous run from a chosen node."""
     from tidelock.engine import _most_recent_run, branch_run, prompt_select_node, start_flow
+
     if pid is None:
         pid = _most_recent_run()
         if pid is None:
@@ -175,6 +179,7 @@ def inspect(
     """Open the TUI inspector."""
     from tidelock.engine import _most_recent_run, prompt_select_node
     from tidelock.tui import NodeInspectorApp
+
     if pid is None:
         pid = _most_recent_run()
         if pid is None:

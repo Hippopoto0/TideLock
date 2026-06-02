@@ -37,9 +37,9 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from tidelock.engine import PipelineState as TLState
 
-from tidelock.engine import Flow, RetryPolicy, cli, pipeline, split, step
+from tidelock.engine import Flow, RetryPolicy, pipeline, split, step
+from tidelock.engine import PipelineState as TLState
 
 _LOGS_DIR = Path(__file__).parent / "logs"
 _LOGS_DIR.mkdir(exist_ok=True)
@@ -50,6 +50,7 @@ _fail_filings: bool = False
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
+
 
 class PipelineState(TLState):
     topic: str = "renewable energy investment landscape"
@@ -83,6 +84,7 @@ _REPORTS = [
 
 
 # ── Steps ─────────────────────────────────────────────────────────────────────
+
 
 @step("plan")
 async def plan(shared: PipelineState) -> None:
@@ -137,6 +139,7 @@ async def summarise(shared: PipelineState) -> None:
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
+
 @pipeline()
 def build() -> Flow:
     return Flow(
@@ -150,14 +153,18 @@ def build() -> Flow:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+
 @_app.command()
 def run(
-    fail_filings: Annotated[bool, typer.Option("--fail-filings", help="Simulate a fetch_filings failure")] = False,
+    fail_filings: Annotated[
+        bool, typer.Option("--fail-filings", help="Simulate a fetch_filings failure")
+    ] = False,
 ) -> None:
     """Execute the pipeline from the start node."""
     global _fail_filings
     _fail_filings = fail_filings
     from tidelock.engine import start_flow
+
     start_flow("run")
 
 
@@ -168,6 +175,7 @@ def resume(
 ) -> None:
     """Resume a previous run from a chosen node."""
     from tidelock.engine import _most_recent_run, branch_run, prompt_select_node, start_flow
+
     if pid is None:
         pid = _most_recent_run()
         if pid is None:
@@ -189,6 +197,7 @@ def inspect(
     """Open the TUI inspector."""
     from tidelock.engine import _most_recent_run, prompt_select_node
     from tidelock.tui import NodeInspectorApp
+
     if pid is None:
         pid = _most_recent_run()
         if pid is None:
