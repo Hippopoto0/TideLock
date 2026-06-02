@@ -163,11 +163,17 @@ def run(
 
 @_app.command()
 def resume(
-    pid: str = typer.Argument(..., help="Run PID to resume from"),
+    pid: str | None = typer.Argument(None, help="Run PID to resume from (defaults to most recent)"),
     from_node: str | None = typer.Option(None, "--from-node", "-f"),
 ) -> None:
     """Resume a previous run from a chosen node."""
-    from tidelock.engine import branch_run, prompt_select_node, start_flow
+    from tidelock.engine import _most_recent_run, branch_run, prompt_select_node, start_flow
+    if pid is None:
+        pid = _most_recent_run()
+        if pid is None:
+            typer.secho("No runs found.", fg=typer.colors.RED)
+            raise typer.Exit(1)
+        typer.echo(f"Using most recent run: {pid}")
     if from_node is None:
         from_node = prompt_select_node(pid, "Select node to resume from:", checkpointed_only=False)
         if not from_node:

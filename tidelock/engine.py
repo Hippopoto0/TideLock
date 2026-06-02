@@ -727,12 +727,19 @@ def run():
 
 @cli.command()
 def resume(
-    pid: str = typer.Argument(..., help="The explicit PID folder to recover from"),
+    pid: str | None = typer.Argument(None, help="Run PID to resume from (defaults to most recent)"),
     from_node: str | None = typer.Option(
         None, "--from-node", "-f", help="The specific node name to start executing fresh from"
     ),
 ):
     """Branch a run from a chosen node into a new run (source run is left unchanged)."""
+    if pid is None:
+        pid = _most_recent_run()
+        if pid is None:
+            typer.secho("No runs found in .pipeline_runs/", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        typer.echo(f"Using most recent run: {pid}")
+
     if from_node is None:
         from_node = prompt_select_node(
             pid,
