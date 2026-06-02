@@ -289,8 +289,8 @@ class NodeInspectorApp(App):
         self.current_text = ""
         self.view_kind = None
 
-        if ext == ".parquet":
-            df = pd.read_parquet(file_path)
+        if ext == ".csv":
+            df = pd.read_csv(file_path, index_col=0)
             self.view_kind = "dataframe"
             self.current_data = df
             self.current_text = df.to_csv(index=False)

@@ -448,7 +448,7 @@ def save_node_state(pid: str, node_name: str, shared) -> None:
         if value is None:
             continue
         if isinstance(value, pd.DataFrame):
-            value.to_parquet(os.path.join(node_dir, f"{key}.parquet"))
+            value.to_csv(os.path.join(node_dir, f"{key}.csv"), index=True)
         else:
             with open(os.path.join(node_dir, f"{key}.msgpack"), "wb") as f:
                 f.write(msgpack.packb(value, use_bin_type=True))
@@ -464,9 +464,9 @@ def save_node_checkpoint(pid, node_name, shared, action):
 
 def load_node_checkpoint(pid, node_name, shared):
     node_dir = os.path.join(RUNS_DIR, pid, node_name)
-    for p_file in glob.glob(os.path.join(node_dir, "*.parquet")):
-        key = os.path.splitext(os.path.basename(p_file))[0]
-        setattr(shared, key, pd.read_parquet(p_file))
+    for csv_file in glob.glob(os.path.join(node_dir, "*.csv")):
+        key = os.path.splitext(os.path.basename(csv_file))[0]
+        setattr(shared, key, pd.read_csv(csv_file, index_col=0))
     for m_file in glob.glob(os.path.join(node_dir, "*.msgpack")):
         key = os.path.splitext(os.path.basename(m_file))[0]
         if key == "_action":

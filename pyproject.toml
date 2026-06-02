@@ -7,7 +7,6 @@ requires-python = ">=3.12.8"
 dependencies = [
     "msgpack>=1.1.2",
     "pandas>=3.0.3",
-    "pyarrow>=24.0.0",
     "pydantic>=2.13.4",
     "questionary>=2.1.1",
     "textual>=8.2.7",
