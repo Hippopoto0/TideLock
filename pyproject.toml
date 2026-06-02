@@ -1,7 +1,7 @@
 [project]
 name = "tidelock"
 version = "0.1.0"
-description = "PocketFlow-style checkpointing pipeline framework"
+description = "Zero-infrastructure workflow orchestration with automatic checkpointing"
 readme = "README.md"
 requires-python = ">=3.12.8"
 dependencies = [
