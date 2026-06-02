@@ -1,32 +1,55 @@
+from __future__ import annotations
+
 import asyncio
 import glob
-import inspect
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import time
 import traceback
 import typing
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any, TypeVar
 
 import msgpack
 import pandas as pd
+import questionary
 import typer
 from pydantic import BaseModel, Field
 from pydantic._internal._model_construction import ModelMetaclass
 
+T = TypeVar("T")
+
 RUNS_DIR = "./.pipeline_runs"
-_flow_generator = None  # Holds the user's create_graph function
+_PID_PATTERN = re.compile(r"^run_\d{8}_\d{6}$")
+_flow_generator: Callable[[], Flow] | None = None
 
 # Collection types that get an automatic default_factory when left bare
 _COLLECTION_ORIGINS = (list, dict, set)
 
 
+def _validate_pid(pid: str) -> str:
+    """Validate that *pid* matches the expected ``run_YYYYMMDD_HHMMSS`` format.
+
+    Raises ``typer.Exit`` (exit code 1) if the format is invalid, which
+    prevents path-traversal attacks via user-supplied PID values.
+    """
+    if not _PID_PATTERN.match(pid):
+        typer.secho(
+            f"Error: Invalid run PID '{pid}'. Expected format: run_YYYYMMDD_HHMMSS.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+    return pid
+
+
 # --- 0. PIPELINE STATE ---
+
 
 class FieldRef:
     """A reference to a named field on a PipelineState subclass.
@@ -38,6 +61,7 @@ class FieldRef:
 
     Used by .map() to avoid magic strings.
     """
+
     __slots__ = ("name",)
 
     def __init__(self, name: str) -> None:
@@ -47,7 +71,7 @@ class FieldRef:
         return f"FieldRef({self.name!r})"
 
 
-def _collection_factory(annotation) -> type | None:
+def _collection_factory(annotation: str | type) -> type | None:
     """Return the collection factory for an annotation, or None if not a collection.
 
     Handles both real type objects (``list[str]``) and stringified annotations
@@ -64,7 +88,13 @@ def _collection_factory(annotation) -> type | None:
 
 
 class _PipelineStateMeta(ModelMetaclass):
-    def __new__(mcs, name, bases, namespace, **kwargs):
+    def __new__(
+        mcs,
+        name: str,
+        bases: tuple[type, ...],
+        namespace: dict[str, Any],
+        **kwargs: Any,
+    ) -> _PipelineStateMeta:
         annotations = namespace.get("__annotations__", {})
 
         for field_name, annotation in annotations.items():
@@ -107,6 +137,7 @@ class PipelineState(BaseModel, metaclass=_PipelineStateMeta):
 
 # --- 1. RETRY POLICY ---
 
+
 @dataclass
 class RetryPolicy:
     """Retry policy for a pipeline step.
@@ -128,38 +159,62 @@ class RetryPolicy:
 
 # --- 1. GRAPH PRIMITIVES ---
 
+
 @dataclass
 class Edge:
-    source: "Node"
-    target: "Node"
+    """A directed edge between two nodes in a pipeline graph.
+
+    May carry an optional *condition* label; if set, the edge is only
+    traversed when the source step returns that exact label.
+    """
+
+    source: Node
+    target: Node
     condition: str | None = None
 
 
 @dataclass
 class SplitEdge:
-    """Fan-out edge produced by the split() helper."""
-    source: "Node"
-    targets: list["Node"]
+    """Fan-out edge produced by the ``split()`` helper.
+
+    Connects a single source node to multiple target nodes that will
+    be executed concurrently.
+    """
+
+    source: Node
+    targets: list[Node]
 
 
 @dataclass
 class ConditionalBranch:
-    node: "Node"
+    """Intermediate produced by ``node - "label"`` in the DSL.
+
+    Combining with ``>> target`` produces a conditional ``Edge``.
+    """
+
+    node: Node
     label: str
 
-    def __rshift__(self, other: "Node") -> Edge:
+    def __rshift__(self, other: Node) -> Edge:
         return Edge(self.node, other, condition=self.label)
 
 
 class Node:
-    def __init__(self, name: str, func, retry: RetryPolicy | None = None):
+    """A single step in a pipeline graph, wrapping a callable + retry config."""
+
+    def __init__(
+        self,
+        name: str,
+        func: Callable[..., Any],
+        retry: RetryPolicy | None = None,
+    ) -> None:
         self.name = name
         self.func = func
         self.retry = retry
-        self.transitions: dict[str, "Node"] = {}
-        self.split_targets: list["Node"] = []
+        self.transitions: dict[str, Node] = {}
+        self.split_targets: list[Node] = []
 
-    def __rshift__(self, other: "Node | SplitGroup") -> "Edge | SplitGroup":
+    def __rshift__(self, other: Any) -> Any:
         if isinstance(other, SplitGroup):
             other._source = self
             return other
@@ -170,9 +225,13 @@ class Node:
 
 
 class SplitGroup:
-    """Returned by split(); participates in the >> DSL to produce fan-out edges."""
+    """Returned by ``split()``; participates in the ``>>`` DSL.
 
-    def __init__(self, *nodes: Node):
+    When used in a ``Flow`` edge chain, produces fan-out edges so that
+    all member nodes run concurrently via ``asyncio.gather``.
+    """
+
+    def __init__(self, *nodes: Node) -> None:
         self.nodes = list(nodes)
         self._source: Node | None = None
 
@@ -204,13 +263,24 @@ def split(*nodes: Node) -> SplitGroup:
 
 
 class Flow:
+    """A directed acyclic graph of pipeline steps with checkpointing support.
+
+    Constructed via the ``>>`` / ``-`` DSL::
+
+        Flow(
+            fetch >> validate,
+            (validate - "has_data") >> process,
+            state_cls=State,
+        )
+    """
+
     def __init__(
         self,
-        *edge_args: "Edge | SplitEdge | list[Edge | SplitEdge]",
+        *edge_args: Any,
         state_cls: type[BaseModel],
         on_node_start: Callable[[str], None] | None = None,
         on_node_skip: Callable[[str], None] | None = None,
-    ):
+    ) -> None:
         if not edge_args:
             raise ValueError("Flow requires at least one edge")
 
@@ -243,10 +313,14 @@ class Flow:
         self.start = starts.pop()
         self.state_cls = state_cls
         self.node_order = _ordered_node_names(self.start)
-        self.on_node_start = on_node_start or (lambda name: typer.echo(f"🚀 Running node: '{name}'..."))
-        self.on_node_skip = on_node_skip or (lambda name: typer.echo(f"↩️  [RESUME] Skipping node '{name}'..."))
+        self.on_node_start = on_node_start or (
+            lambda name: typer.echo(f"Running node: '{name}'...")
+        )
+        self.on_node_skip = on_node_skip or (
+            lambda name: typer.echo(f"[RESUME] Skipping node '{name}'...")
+        )
 
-    def _run_async(self, coro) -> any:
+    def _run_async(self, coro: Coroutine[Any, Any, T]) -> T:
         """Run a coroutine on a persistent event loop, creating one if needed."""
         try:
             loop = asyncio.get_event_loop()
@@ -257,7 +331,7 @@ class Flow:
             asyncio.set_event_loop(loop)
         return loop.run_until_complete(coro)
 
-    def run(self, mode: str, pid: str, from_node: str | None = None):
+    def run(self, mode: str, pid: str, from_node: str | None = None) -> None:
         save_run_metadata(pid, self.node_order)
         run_started_at = datetime.now()
         try:
@@ -290,7 +364,7 @@ class Flow:
             duration_s=round((finished_at - run_started_at).total_seconds(), 3),
         )
 
-    async def _execute(self, mode: str, pid: str, from_node: str | None):
+    async def _execute(self, mode: str, pid: str, from_node: str | None) -> None:
         """Main execution loop — handles sequential steps and split groups."""
         shared = self.state_cls()
         current_node: Node | None = self.start
@@ -313,7 +387,7 @@ class Flow:
                 current_node = current_node.transitions.get("default")
 
     async def _run_one(
-        self, pid: str, node: Node, shared, mode: str, force_run: bool
+        self, pid: str, node: Node, shared: BaseModel, mode: str, force_run: bool
     ) -> tuple[str, bool]:
         """Run or skip a single node. Returns (action, was_run)."""
         node_dir = os.path.join(RUNS_DIR, pid, node.name)
@@ -336,33 +410,41 @@ class Flow:
             action = result if result is not None else "default"
         except Exception as exc:
             completed_at = datetime.now()
-            save_step_meta(pid, node.name, {
-                "status": "failed",
-                "started_at": started_at.isoformat(),
-                "completed_at": completed_at.isoformat(),
-                "duration_s": round((completed_at - started_at).total_seconds(), 3),
-                "retry_attempts": getattr(node.func, "_attempts_taken", 1),
-                "error_type": type(exc).__name__,
-                "error_message": str(exc),
-            })
+            save_step_meta(
+                pid,
+                node.name,
+                {
+                    "status": "failed",
+                    "started_at": started_at.isoformat(),
+                    "completed_at": completed_at.isoformat(),
+                    "duration_s": round((completed_at - started_at).total_seconds(), 3),
+                    "retry_attempts": getattr(node.func, "_attempts_taken", 1),
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+            )
             save_node_state(pid, node.name, shared)
             raise
 
         completed_at = datetime.now()
-        save_step_meta(pid, node.name, {
-            "status": "completed",
-            "started_at": started_at.isoformat(),
-            "completed_at": completed_at.isoformat(),
-            "duration_s": round((completed_at - started_at).total_seconds(), 3),
-            "retry_attempts": getattr(node.func, "_attempts_taken", 1),
-            "error_type": None,
-            "error_message": None,
-        })
+        save_step_meta(
+            pid,
+            node.name,
+            {
+                "status": "completed",
+                "started_at": started_at.isoformat(),
+                "completed_at": completed_at.isoformat(),
+                "duration_s": round((completed_at - started_at).total_seconds(), 3),
+                "retry_attempts": getattr(node.func, "_attempts_taken", 1),
+                "error_type": None,
+                "error_message": None,
+            },
+        )
         save_node_checkpoint(pid, node.name, shared, action)
         return action, True
 
     async def _run_split(
-        self, pid: str, source: Node, shared, mode: str, force_run: bool
+        self, pid: str, source: Node, shared: BaseModel, mode: str, force_run: bool
     ) -> Node | None:
         """Run all split targets concurrently. Returns the join node."""
         results = await asyncio.gather(
@@ -385,6 +467,7 @@ class Flow:
 
 # --- 2. STATE PERSISTENCE HELPERS ---
 def _ordered_node_names(start: Node) -> list[str]:
+    """BFS traversal from *start* returning node names in execution order."""
     order: list[str] = []
     seen: set[str] = set()
     queue = [start]
@@ -402,23 +485,31 @@ def _ordered_node_names(start: Node) -> list[str]:
 
 
 def save_run_metadata(pid: str, nodes: list[str]) -> None:
+    """Write run metadata (node order + status) to ``metadata.json``.
+
+    If the file already exists (e.g. on resume) this is a no-op.
+    """
     pid_dir = os.path.join(RUNS_DIR, pid)
     os.makedirs(pid_dir, exist_ok=True)
     metadata_path = os.path.join(pid_dir, "metadata.json")
     if os.path.exists(metadata_path):
         return
     with open(metadata_path, "w") as f:
-        json.dump({
-            "nodes": nodes,
-            "status": "running",
-            "started_at": datetime.now().isoformat(),
-            "completed_at": None,
-            "duration_s": None,
-        }, f, indent=2)
+        json.dump(
+            {
+                "nodes": nodes,
+                "status": "running",
+                "started_at": datetime.now().isoformat(),
+                "completed_at": None,
+                "duration_s": None,
+            },
+            f,
+            indent=2,
+        )
 
 
-def update_run_metadata(pid: str, **fields) -> None:
-    """Patch specific fields in metadata.json."""
+def update_run_metadata(pid: str, **fields: Any) -> None:
+    """Patch specific fields in ``metadata.json``."""
     metadata_path = os.path.join(RUNS_DIR, pid, "metadata.json")
     if not os.path.exists(metadata_path):
         return
@@ -451,8 +542,11 @@ def load_run_summary(pid: str) -> dict | None:
         return json.load(f)
 
 
-def save_node_state(pid: str, node_name: str, shared) -> None:
-    """Serialize all non-None state fields for a node. Does not write the routing action."""
+def save_node_state(pid: str, node_name: str, shared: BaseModel) -> None:
+    """Serialize all non-None state fields for a node.
+
+    Does not write the routing action (use ``save_node_checkpoint`` for that).
+    """
     node_dir = os.path.join(RUNS_DIR, pid, node_name)
     os.makedirs(node_dir, exist_ok=True)
     for key in shared.model_fields:
@@ -463,18 +557,23 @@ def save_node_state(pid: str, node_name: str, shared) -> None:
             value.to_csv(os.path.join(node_dir, f"{key}.csv"), index=True)
         else:
             with open(os.path.join(node_dir, f"{key}.msgpack"), "wb") as f:
-                f.write(msgpack.packb(value, use_bin_type=True))
+                f.write(msgpack.packb(value, use_bin_type=True))  # type: ignore[arg-type]
 
 
-def save_node_checkpoint(pid, node_name, shared, action):
+def save_node_checkpoint(pid: str, node_name: str, shared: BaseModel, action: str) -> None:
+    """Persist both the routing action and the full node state to disk."""
     node_dir = os.path.join(RUNS_DIR, pid, node_name)
     os.makedirs(node_dir, exist_ok=True)
     with open(os.path.join(node_dir, "_action.msgpack"), "wb") as f:
-        f.write(msgpack.packb(action, use_bin_type=True))
+        f.write(msgpack.packb(action, use_bin_type=True))  # type: ignore[arg-type]
     save_node_state(pid, node_name, shared)
 
 
-def load_node_checkpoint(pid, node_name, shared):
+def load_node_checkpoint(pid: str, node_name: str, shared: BaseModel) -> str:
+    """Restore state from disk for a completed node.
+
+    Returns the routing action that was persisted.
+    """
     node_dir = os.path.join(RUNS_DIR, pid, node_name)
     for csv_file in glob.glob(os.path.join(node_dir, "*.csv")):
         key = os.path.splitext(os.path.basename(csv_file))[0]
@@ -487,17 +586,20 @@ def load_node_checkpoint(pid, node_name, shared):
             setattr(shared, key, msgpack.unpackb(f.read(), raw=False))
 
     with open(os.path.join(node_dir, "_action.msgpack"), "rb") as f:
-        return msgpack.unpackb(f.read(), raw=False)
+        action: str = msgpack.unpackb(f.read(), raw=False)
+        return action
 
 
-def save_step_meta(pid: str, node_name: str, meta: dict) -> None:
+def save_step_meta(pid: str, node_name: str, meta: dict[str, Any]) -> None:
+    """Persist step execution metadata (timing, status, errors) to disk."""
     node_dir = os.path.join(RUNS_DIR, pid, node_name)
     os.makedirs(node_dir, exist_ok=True)
     with open(os.path.join(node_dir, "_meta.msgpack"), "wb") as f:
-        f.write(msgpack.packb(meta, use_bin_type=True))
+        f.write(msgpack.packb(meta, use_bin_type=True))  # type: ignore[arg-type]
 
 
-def load_step_meta(pid: str, node_name: str) -> dict | None:
+def load_step_meta(pid: str, node_name: str) -> dict[str, Any] | None:
+    """Load step execution metadata from disk, or None if unavailable."""
     path = os.path.join(RUNS_DIR, pid, node_name, "_meta.msgpack")
     if not os.path.exists(path):
         return None
@@ -506,10 +608,17 @@ def load_step_meta(pid: str, node_name: str) -> dict | None:
 
 
 def node_has_checkpoint(pid: str, node_name: str) -> bool:
+    """Return True when a checkpoint file exists for *node_name* in *pid*."""
     return os.path.exists(os.path.join(RUNS_DIR, pid, node_name, "_action.msgpack"))
 
 
 def branch_run(source_pid: str, from_node: str) -> str:
+    """Create a new run from *source_pid*, copying checkpoints up to *from_node*.
+
+    The source run is never modified. The new run gets its own PID and
+    starts with state restored from the completed nodes before *from_node*.
+    """
+    _validate_pid(source_pid)
     order = load_run_metadata(source_pid)
     if not order:
         typer.secho(
@@ -544,6 +653,7 @@ def branch_run(source_pid: str, from_node: str) -> str:
 
 
 def list_run_nodes(pid: str, *, checkpointed_only: bool = True) -> list[str]:
+    """Return node names for *pid*, optionally filtering to checkpointed ones."""
     pid_dir = os.path.join(RUNS_DIR, pid)
     if not os.path.exists(pid_dir):
         typer.secho(f"❌ Error: PID '{pid}' not found.", fg=typer.colors.RED, err=True)
@@ -559,8 +669,8 @@ def list_run_nodes(pid: str, *, checkpointed_only: bool = True) -> list[str]:
 
 
 def prompt_select_node(pid: str, message: str, *, checkpointed_only: bool = True) -> str | None:
-    import questionary
-
+    """Show an interactive ``questionary`` list of nodes and return the selection."""
+    _validate_pid(pid)
     nodes = list_run_nodes(pid, checkpointed_only=checkpointed_only)
     if not nodes:
         typer.echo("⚠️ No node serialization tracking folders discovered for this run.")
@@ -614,13 +724,14 @@ def prompt_select_node(pid: str, message: str, *, checkpointed_only: bool = True
 
 # --- 3. THE FRAMEWORK DECORATORS ---
 
+
 def step(
     name: str,
     *,
     retries: int = 0,
     retry_delay: float = 1.0,
     retry: RetryPolicy | None = None,
-):
+) -> Callable[[Callable[..., Any]], Node]:
     """Declare a pipeline step.
 
     Simple retry shorthand::
@@ -638,71 +749,98 @@ def step(
     if retry is None and retries:
         retry = RetryPolicy(attempts=retries + 1, delay=retry_delay)
 
-    def decorator(func):
+    def _warn(attempt: int, exc: Exception, wait: float, total: int) -> None:
+        typer.secho(
+            f"  Retrying {name} — attempt {attempt}/{total} — "
+            f"{type(exc).__name__}: {exc}  (retry in {wait:.1f}s)",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+
+    def _next_wait(current: float) -> float:
+        assert retry is not None
+        w = current * retry.backoff
+        if retry.jitter:
+            w += w * random.uniform(-retry.jitter, retry.jitter)
+        return w
+
+    def decorator(func: Callable[..., Any]) -> Node:
         if retry is None:
             return Node(name, func)
 
-        policy = retry
-
-        def _warn(attempt: int, exc: Exception, wait: float) -> None:
-            typer.secho(
-                f"  ⚠ {name}  attempt {attempt}/{policy.attempts} — "
-                f"{type(exc).__name__}: {exc}  (retry in {wait:.1f}s)",
-                fg=typer.colors.YELLOW,
-                err=True,
-            )
-
-        def _next_wait(current: float) -> float:
-            w = current * policy.backoff
-            if policy.jitter:
-                w += w * random.uniform(-policy.jitter, policy.jitter)
-            return w
-
         if asyncio.iscoroutinefunction(func):
-            async def _wrapped_async(shared):
-                wait = policy.delay
-                for attempt in range(1, policy.attempts + 1):
-                    try:
-                        result = await func(shared)
-                        _wrapped_async._attempts_taken = attempt
-                        return result
-                    except policy.on as exc:
-                        _wrapped_async._attempts_taken = attempt
-                        if attempt == policy.attempts:
-                            raise
-                        _warn(attempt, exc, wait)
-                        await asyncio.sleep(wait)
-                        wait = _next_wait(wait)
+            return _build_async_retry(name, func, retry, _warn, _next_wait)
 
-            _wrapped_async.__name__ = func.__name__
-            _wrapped_async._attempts_taken = 1
-            return Node(name, _wrapped_async, retry=policy)
-
-        else:
-            def _wrapped_sync(shared):
-                wait = policy.delay
-                for attempt in range(1, policy.attempts + 1):
-                    try:
-                        result = func(shared)
-                        _wrapped_sync._attempts_taken = attempt
-                        return result
-                    except policy.on as exc:
-                        _wrapped_sync._attempts_taken = attempt
-                        if attempt == policy.attempts:
-                            raise
-                        _warn(attempt, exc, wait)
-                        time.sleep(wait)
-                        wait = _next_wait(wait)
-
-            _wrapped_sync.__name__ = func.__name__
-            _wrapped_sync._attempts_taken = 1
-            return Node(name, _wrapped_sync, retry=policy)
+        return _build_sync_retry(name, func, retry, _warn, _next_wait)
 
     return decorator
 
 
-def pipeline():
-    def decorator(func):
+def _build_async_retry(
+    name: str,
+    func: Callable[..., Any],
+    policy: RetryPolicy,
+    warn: Callable[[int, Exception, float, int], None],
+    next_wait: Callable[[float], float],
+) -> Node:
+    """Wrap an async step function with retry logic."""
+
+    async def wrapped(shared: Any) -> Any:
+        wait = policy.delay
+        for attempt in range(1, policy.attempts + 1):
+            try:
+                result = await func(shared)
+                wrapped._attempts_taken = attempt
+                return result
+            except policy.on as exc:
+                wrapped._attempts_taken = attempt
+                if attempt == policy.attempts:
+                    raise
+                warn(attempt, exc, wait, policy.attempts)
+                await asyncio.sleep(wait)
+                wait = next_wait(wait)
+
+    wrapped.__name__ = func.__name__
+    wrapped._attempts_taken = 1
+    return Node(name, wrapped, retry=policy)
+
+
+def _build_sync_retry(
+    name: str,
+    func: Callable[..., Any],
+    policy: RetryPolicy,
+    warn: Callable[[int, Exception, float, int], None],
+    next_wait: Callable[[float], float],
+) -> Node:
+    """Wrap a synchronous step function with retry logic."""
+
+    def wrapped(shared: Any) -> Any:
+        wait = policy.delay
+        for attempt in range(1, policy.attempts + 1):
+            try:
+                result = func(shared)
+                wrapped._attempts_taken = attempt
+                return result
+            except policy.on as exc:
+                wrapped._attempts_taken = attempt
+                if attempt == policy.attempts:
+                    raise
+                warn(attempt, exc, wait, policy.attempts)
+                time.sleep(wait)
+                wait = next_wait(wait)
+
+    wrapped.__name__ = func.__name__
+    wrapped._attempts_taken = 1
+    return Node(name, wrapped, retry=policy)
+
+
+def pipeline() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Decorator that registers a function as the pipeline graph constructor.
+
+    The decorated function should return a :class:`Flow` instance.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         global _flow_generator
         _flow_generator = func
         return func
@@ -714,8 +852,9 @@ def pipeline():
 cli = typer.Typer(help="TideLock: PocketFlow-Style Architecture", no_args_is_help=True)
 
 
-def start_flow(mode: str, pid: str | None = None, from_node: str | None = None):
+def start_flow(mode: str, pid: str | None = None, from_node: str | None = None) -> None:
     pid = pid or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    _validate_pid(pid)
     if mode == "resume" and not os.path.exists(os.path.join(RUNS_DIR, pid)):
         typer.secho(f"❌ Error: PID '{pid}' does not exist.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
@@ -766,21 +905,20 @@ def resume(
 
 
 def _most_recent_run() -> str | None:
-    """Return the most recently modified run directory under RUNS_DIR, or None."""
+    """Return the most recently modified run directory under RUNS_DIR, or ``None``."""
     runs_path = os.path.join(RUNS_DIR)
     if not os.path.exists(runs_path):
         return None
-    dirs = [
-        d for d in os.listdir(runs_path)
-        if os.path.isdir(os.path.join(runs_path, d))
-    ]
+    dirs = [d for d in os.listdir(runs_path) if os.path.isdir(os.path.join(runs_path, d))]
     if not dirs:
         return None
     return max(dirs, key=lambda d: os.path.getmtime(os.path.join(runs_path, d)))
 
 
-@cli.command()
-def inspect(pid: str | None = typer.Argument(None, help="Run PID to inspect (defaults to most recent)")):
+@cli.command(name="inspect")
+def inspect_pid(
+    pid: str | None = typer.Argument(None, help="Run PID to inspect (defaults to most recent)"),
+):
     """Interactively select a node via searchable list, then launch the Textual TUI viewer."""
     if pid is None:
         pid = _most_recent_run()

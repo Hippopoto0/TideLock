@@ -1,14 +1,27 @@
+from __future__ import annotations
+
 import json
 import os
 import re
 from dataclasses import dataclass
+from typing import Any
 
 import msgpack
 import pandas as pd
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, Static, TextArea
 from textual.document._document import Selection
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    Static,
+    TextArea,
+)
 
 from tidelock.engine import RUNS_DIR, load_step_meta
 
@@ -18,6 +31,8 @@ MAX_SEARCH_MATCHES = 100
 
 @dataclass
 class SearchMatch:
+    """A single regex match within the inspected node's state content."""
+
     index: int
     start: int
     end: int
@@ -68,6 +83,8 @@ def find_regex_matches(
 
 
 class NodeInspectorApp(App):
+    """Textual TUI for browsing a run's node checkpoints with regex search."""
+
     CSS = """
     Screen { background: #1a1a1a; }
     #sidebar { width: 32; background: #262626; border-right: tall #333; }
@@ -89,26 +106,26 @@ class NodeInspectorApp(App):
         ("q", "quit", "Exit Node Viewer"),
     ]
 
-    def __init__(self, pid: str, node_name: str):
+    def __init__(self, pid: str, node_name: str) -> None:
         super().__init__()
         self.pid = pid
         self.node_name = node_name
         self.node_dir = os.path.join(RUNS_DIR, pid, node_name)
-        self.step_meta: dict | None = load_step_meta(pid, node_name)
-        self.variables = []
+        self.step_meta: dict[str, Any] | None = load_step_meta(pid, node_name)
+        self.variables: list[str] = []
         if os.path.exists(self.node_dir):
-            # Exclude all internal files (underscore-prefixed)
-            self.variables = sorted(
-                f for f in os.listdir(self.node_dir) if not f.startswith("_")
-            )
-        self.file_by_var_id = {f"var-{i}": filename for i, filename in enumerate(self.variables)}
-        self.current_text = ""
+            self.variables = sorted(f for f in os.listdir(self.node_dir) if not f.startswith("_"))
+        self.file_by_var_id: dict[str, str] = {
+            f"var-{i}": filename for i, filename in enumerate(self.variables)
+        }
+        self.current_text: str = ""
         self.view_kind: str | None = None
-        self.current_data = None
+        self.current_data: Any = None
         self.search_matches: list[SearchMatch] = []
         self.search_error: str | None = None
 
     def _format_meta(self) -> str:
+        """Render step metadata as Rich markup for the sidebar."""
         m = self.step_meta
         if not m:
             return ""
@@ -165,6 +182,7 @@ class NodeInspectorApp(App):
         yield Footer()
 
     def _hide_search(self) -> None:
+        """Hide the search bar and clear results."""
         search = self.query_one("#search_input", Input)
         search.remove_class("visible")
         search.value = ""
@@ -173,15 +191,18 @@ class NodeInspectorApp(App):
         self.search_error = None
 
     def _hide_text_view(self) -> None:
+        """Hide the text viewer widget."""
         text_view = self.query_one("#text_view", TextArea)
         text_view.remove_class("visible")
         text_view.text = ""
 
     @property
     def _content_language(self) -> str:
+        """Return the TextArea language for the current view kind."""
         return "json" if self.view_kind == "msgpack" else "text"
 
     def _show_text_content(self, content: str, *, language: str | None = None) -> None:
+        """Show *content* in the text viewer with an optional syntax language."""
         table = self.query_one("#df_view", DataTable)
         text_view = self.query_one("#text_view", TextArea)
         table.display = False
@@ -190,13 +211,14 @@ class NodeInspectorApp(App):
         text_view.add_class("visible")
 
     def _show_default_view(self) -> None:
+        """Render the currently selected variable (DataFrame table or JSON text)."""
         table = self.query_one("#df_view", DataTable)
         table.clear(columns=True)
         self._hide_text_view()
         table.display = False
 
         if self.view_kind == "dataframe" and self.current_data is not None:
-            df = self.current_data
+            df: pd.DataFrame = self.current_data
             table.display = True
             table.add_columns(*df.columns)
             table.add_rows(df.values.tolist())
@@ -204,6 +226,7 @@ class NodeInspectorApp(App):
             self._show_text_content(self.current_text, language=self._content_language)
 
     def _goto_match(self, match_index: int) -> None:
+        """Scroll the text viewer to the *match_index*-th search hit."""
         if match_index < 0 or match_index >= len(self.search_matches):
             return
 
@@ -218,6 +241,7 @@ class NodeInspectorApp(App):
         text_view.scroll_cursor_visible(animate=False)
 
     async def _show_search_results(self, pattern: str) -> None:
+        """Find all regex matches in the current content and display them."""
         self.search_error = None
         try:
             re.compile(pattern, re.IGNORECASE)
@@ -252,6 +276,7 @@ class NodeInspectorApp(App):
         self._show_text_content(self.current_text, language=self._content_language)
 
     def action_focus_search(self) -> None:
+        """Focus the search input bar."""
         if not self.current_text:
             return
         search = self.query_one("#search_input", Input)
@@ -259,10 +284,12 @@ class NodeInspectorApp(App):
         search.focus()
 
     def action_clear_search(self) -> None:
+        """Clear the search bar and restore the default view."""
         self._hide_search()
         self._show_default_view()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Handle search input submission."""
         if event.input.id != "search_input":
             return
 
@@ -274,14 +301,21 @@ class NodeInspectorApp(App):
         await self._show_search_results(pattern)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
+        """Handle sidebar variable selection or search-match navigation."""
+        item_id = event.item.id
+        if item_id is None:
+            return
+
         if event.list_view.id == "match_list":
-            match_index = int(event.item.id.removeprefix("match-"))
+            match_index = int(item_id.removeprefix("match-"))
             self._goto_match(match_index)
             return
 
         self._hide_search()
 
-        filename = self.file_by_var_id[event.item.id]
+        filename = self.file_by_var_id.get(item_id)
+        if filename is None:
+            return
         file_path = os.path.join(self.node_dir, filename)
         _, ext = os.path.splitext(filename)
 
@@ -296,7 +330,7 @@ class NodeInspectorApp(App):
             self.current_text = df.to_csv(index=False)
         elif ext == ".msgpack":
             with open(file_path, "rb") as f:
-                data = msgpack.unpackb(f.read(), raw=False)
+                data: Any = msgpack.unpackb(f.read(), raw=False)
             self.view_kind = "msgpack"
             self.current_data = data
             self.current_text = json.dumps(data, indent=2, default=str)

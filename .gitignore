@@ -1,2 +1,6 @@
-tidelock/__pycache__/
+__pycache__/
+*.pyc
+*.egg-info/
 .pipeline_runs/
+.DS_Store
+examples/logs/

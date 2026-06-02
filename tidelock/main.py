@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 import time
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict
 
-from engine import Flow, cli, pipeline, step
+from tidelock.engine import Flow, cli, pipeline, step
 
 
 class SharedState(BaseModel):
@@ -16,7 +18,7 @@ class SharedState(BaseModel):
 
 
 @step("fetch_orders")
-def fetch_orders(shared: SharedState):
+def fetch_orders(shared: SharedState) -> None:
     time.sleep(0.5)
     shared.api_meta = {
         "endpoint": "/v3/orders",
@@ -47,29 +49,24 @@ def fetch_orders(shared: SharedState):
 
 
 @step("validate_transform")
-def validate_transform(shared: SharedState):
+def validate_transform(shared: SharedState) -> str:
     df = pd.DataFrame(shared.raw_records)
     shared.order_dataframe = df
-
-    # raise RuntimeError("Mock transformation interruption!")
-
-    if df["total"].sum() > 500:
-        return "high_volume"
-    return "standard_volume"
+    return "high_volume" if df["total"].sum() > 500 else "standard_volume"
 
 
 @step("route_vip_treatment")
-def route_vip_treatment(shared: SharedState):
+def route_vip_treatment(shared: SharedState) -> None:
     shared.routing_tag = "Executed Enterprise Premium Workflow Logic"
 
 
 @step("route_standard_treatment")
-def route_standard_treatment(shared: SharedState):
+def route_standard_treatment(shared: SharedState) -> None:
     shared.routing_tag = "Executed Basic Standalone Processing Layout"
 
 
 @pipeline()
-def construct_business_graph():
+def construct_business_graph() -> Flow:
     return Flow(
         fetch_orders >> validate_transform,
         (validate_transform - "high_volume") >> route_vip_treatment,

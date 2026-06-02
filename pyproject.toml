@@ -1,9 +1,24 @@
+[build-system]
+requires = ["setuptools>=64.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tidelock"
 version = "0.1.0"
 description = "Zero-infrastructure workflow orchestration with automatic checkpointing"
 readme = "README.md"
 requires-python = ">=3.12.8"
+authors = [
+    {name = "TideLock contributors"},
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "msgpack>=1.1.2",
     "pandas>=3.0.3",
@@ -12,3 +27,31 @@ dependencies = [
     "textual>=8.2.7",
     "typer>=0.25.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/anomalyco/TideLock"
+Repository = "https://github.com/anomalyco/TideLock"
+Documentation = "https://github.com/anomalyco/TideLock#readme"
+
+[project.scripts]
+tidelock = "tidelock.main:cli"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "ARG"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"examples/*" = ["N"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+include = ["tidelock", "examples"]
+exclude = ["**/node_modules", "**/__pycache__", "**/.git"]
